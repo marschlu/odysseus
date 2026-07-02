@@ -25,6 +25,10 @@ class DocumentCreate(BaseModel):
     title: str = "Untitled"
     language: Optional[str] = None
     content: str = ""
+    # Nextcloud provenance: present when the doc is opened from / created for a
+    # file on a configured Nextcloud account. Drives the save→Nextcloud writeback.
+    source_nextcloud_account: Optional[str] = None
+    source_nextcloud_path: Optional[str] = None
 
 class DocumentUpdate(BaseModel):
     content: str
@@ -56,6 +60,12 @@ def _doc_to_dict(doc: Document) -> Dict[str, Any]:
         "source_email_folder":     getattr(doc, "source_email_folder", None),
         "source_email_account_id": getattr(doc, "source_email_account_id", None),
         "source_email_message_id": getattr(doc, "source_email_message_id", None),
+        # Nextcloud provenance + last sync outcome (drives badge/filter + writeback).
+        "source_nextcloud_account": getattr(doc, "source_nextcloud_account", None),
+        "source_nextcloud_path":    getattr(doc, "source_nextcloud_path", None),
+        "nextcloud_sync_status":    getattr(doc, "nextcloud_sync_status", None),
+        "nextcloud_synced_at":      (doc.nextcloud_synced_at.isoformat() + "Z") if getattr(doc, "nextcloud_synced_at", None) else None,
+        "nextcloud_sync_error":     getattr(doc, "nextcloud_sync_error", None),
     }
 
 def _version_to_dict(v: DocumentVersion) -> Dict[str, Any]:

@@ -54,6 +54,30 @@ def test_is_markitdown_format():
     assert not is_markitdown_format("readme.md")  # text stays on the text path
 
 
+def test_native_xlsx_fallback_extracts_cells(tmp_path, monkeypatch):
+    """Without markitdown/openpyxl (e.g. slim Docker), .xlsx still extracts to
+    tab-separated rows via the bundled pure-Python reader."""
+    import zipfile
+
+    _block_markitdown_import(monkeypatch)
+    shared = (b'<?xml version="1.0"?>\n'
+              b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+              b'<si><t>Name</t></si><si><t>Alice</t></si></sst>')
+    sheet = (b'<?xml version="1.0"?>\n'
+             b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+             b'<sheetData>'
+             b'<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c></row>'
+             b'<row r="2"><c r="A2" t="s"><v>1</v></c></row>'
+             b'</sheetData></worksheet>')
+    path = tmp_path / "data.xlsx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/sharedStrings.xml", shared)
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+
+    md = convert_to_markdown(str(path))
+    assert md and "Name" in md and "Alice" in md and "42" in md
+
+
 def test_markitdown_exts_cover_dropped_office_formats():
     for ext in (".docx", ".pptx", ".xlsx", ".xls"):
         assert ext in MARKITDOWN_EXTS

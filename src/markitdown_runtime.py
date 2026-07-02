@@ -72,27 +72,83 @@ def _extract_docx_native(path: str) -> str | None:
     return "\n\n".join(paragraphs) if paragraphs else None
 
 
+def _extract_xlsx_native(path: str) -> str | None:
+    """Pure-Python .xlsx text extractor — no external deps.
+
+    Reads the shared-string table + first worksheet and emits rows as
+    tab-separated values, so a spreadsheet is readable for summarizing even
+    when markitdown/openpyxl aren't installed (e.g. the slim Docker image).
+    Handles strings, inline strings, and plain numbers; formulas, styling,
+    and later sheets are ignored.
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            strings: list[str] = []
+            if "xl/sharedStrings.xml" in names:
+                try:
+                    sroot = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                    for si in sroot.iter(f"{ns}si"):
+                        strings.append("".join((t.text or "") for t in si.iter(f"{ns}t")))
+                except ET.ParseError:
+                    pass
+            sheet_names = [n for n in names if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+            if not sheet_names:
+                return None
+            try:
+                root = ET.fromstring(z.read(sheet_names[0]))
+            except ET.ParseError:
+                return None
+            rows_out: list[str] = []
+            for row in root.iter(f"{ns}row"):
+                cells: list[str] = []
+                for c in row.iter(f"{ns}c"):
+                    t = c.get("t")
+                    v_el = c.find(f"{ns}v")
+                    val = v_el.text if (v_el is not None and v_el.text) else ""
+                    if t == "s" and val.isdigit():
+                        idx = int(val)
+                        val = strings[idx] if idx < len(strings) else val
+                    elif t == "inlineStr":
+                        is_el = c.find(f"{ns}is")
+                        if is_el is not None:
+                            val = "".join((tt.text or "") for tt in is_el.iter(f"{ns}t"))
+                    cells.append(val)
+                if any(cells):
+                    rows_out.append("\t".join(cells))
+            return "\n".join(rows_out) if rows_out else None
+    except (zipfile.BadZipFile, OSError):
+        return None
+
+
+
 def convert_to_markdown(path: str) -> str | None:
     """Convert a document to Markdown text via markitdown.
 
     Returns the extracted Markdown, or ``None`` if markitdown is unavailable or
     the conversion fails — callers degrade gracefully rather than erroring.
 
-    Fallback: when markitdown isn't installed and the file is a .docx, run
-    the bundled pure-Python extractor so the most common case (Word docs)
-    works out of the box. Other Office/EPUB formats still need markitdown.
+    Fallback: when markitdown isn't installed, run a bundled pure-Python
+    extractor for .docx and .xlsx so the two most common Office formats work
+    out of the box (the latter matters for the slim Docker image, which has no
+    markitdown/openpyxl). Other Office/EPUB formats still need markitdown.
     """
     try:
         markitdown_cls = load_markitdown()
     except RuntimeError:
-        if isinstance(path, str) and path.lower().endswith(".docx"):
-            text = _extract_docx_native(path)
-            if text:
-                logger.info(
-                    "markitdown not installed — used native .docx extractor for %s",
-                    path,
-                )
-                return text
+        ext = os.path.splitext(path)[1].lower() if isinstance(path, str) else ""
+        native = None
+        if ext == ".docx":
+            native = _extract_docx_native(path)
+        elif ext == ".xlsx":
+            native = _extract_xlsx_native(path)
+        if native:
+            logger.info("markitdown not installed — used native %s extractor for %s", ext, path)
+            return native
         logger.warning("markitdown not installed; cannot extract %s", path)
         return None
     try:
