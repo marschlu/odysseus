@@ -235,6 +235,16 @@ class Document(TimestampMixin, Base):
     source_email_folder      = Column(String, nullable=True)
     source_email_account_id  = Column(String, nullable=True)
     source_email_message_id  = Column(String, nullable=True, index=True)
+    # Nextcloud provenance: set when this document was opened from (or created
+    # for) a file on a configured Nextcloud account. Drives the Library's
+    # Nextcloud badge + source filter, and the save→Nextcloud writeback. Sync
+    # status is the LAST outcome only: "synced" | "error" (NULL = never synced,
+    # e.g. brand-new doc not yet saved back). Added via a startup migration.
+    source_nextcloud_account = Column(String, nullable=True, index=True)
+    source_nextcloud_path    = Column(String, nullable=True)
+    nextcloud_sync_status    = Column(String, nullable=True)    # "synced" | "error" | NULL
+    nextcloud_synced_at      = Column(DateTime, nullable=True)
+    nextcloud_sync_error     = Column(String, nullable=True)
 
     session  = relationship("Session", backref=backref("documents", cascade="save-update, merge"))
     versions = relationship("DocumentVersion", back_populates="document",
@@ -768,6 +778,54 @@ def _migrate_add_document_archived_column():
             logging.getLogger(__name__).info("Migrated: added 'archived' to documents")
     except Exception as e:
         logging.getLogger(__name__).warning(f"documents.archived migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_add_nextcloud_document_columns():
+    """Add Nextcloud provenance + sync-status columns to documents.
+
+    Guarded + idempotent (each column is added only if missing), so it is safe
+    on existing databases and a no-op on fresh ones (create_all already makes
+    them). Read by the Library's Nextcloud badge/filter and the save writeback.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+        adds = {
+            "source_nextcloud_account": "VARCHAR",
+            "source_nextcloud_path": "VARCHAR",
+            "nextcloud_sync_status": "VARCHAR",
+            "nextcloud_synced_at": "DATETIME",
+            "nextcloud_sync_error": "VARCHAR",
+        }
+        changed = False
+        for col, typ in adds.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {typ}")
+                changed = True
+        # Index the account column so the Library source filter is cheap.
+        if "source_nextcloud_account" not in existing:
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_documents_source_nextcloud_account "
+                    "ON documents(source_nextcloud_account)"
+                )
+            except Exception:
+                pass
+        if changed:
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added Nextcloud columns to documents")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"documents.nextcloud migration failed: {e}")
     finally:
         try:
             conn.close()
@@ -1831,6 +1889,7 @@ def init_db():
     _migrate_add_task_run_model_column()
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()
+    _migrate_add_nextcloud_document_columns()
     _migrate_add_last_message_at_column()
     _migrate_add_folder_column()
     _migrate_add_token_columns()

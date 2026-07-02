@@ -129,6 +129,11 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 # being deleted. Fall back to the session's owner when the
                 # request is unauthenticated (single-user / localhost bypass).
                 owner=user or (session.owner if session else None),
+                # Nextcloud provenance (optional). On open the local content is
+                # exactly what we just read from remote, so mark it synced.
+                source_nextcloud_account=(req.source_nextcloud_account or None),
+                source_nextcloud_path=(req.source_nextcloud_path or None),
+                nextcloud_sync_status="synced" if (req.source_nextcloud_account and req.source_nextcloud_path) else None,
             )
             ver = DocumentVersion(
                 id=ver_id,
@@ -613,7 +618,8 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             doc.current_content = req.content
             db.commit()
             db.refresh(doc)
-            return _doc_to_dict(doc)
+            result = _doc_to_dict(doc)
+            return result
         except HTTPException:
             raise
         except Exception as e:

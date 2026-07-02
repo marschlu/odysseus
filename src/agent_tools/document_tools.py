@@ -420,7 +420,7 @@ class UpdateDocumentTool:
             db.add(ver)
             db.commit()
 
-            return {
+            result = {
                 "action": "update",
                 "doc_id": target_id,
                 "title": doc.title,
@@ -428,6 +428,7 @@ class UpdateDocumentTool:
                 "content": new_content,
                 "version": new_ver,
             }
+            return result
         except Exception as e:
             db.rollback()
             return {"error": f"Failed to update document: {e}"}
@@ -513,7 +514,7 @@ class EditDocumentTool:
             db.add(ver)
             db.commit()
 
-            return {
+            result = {
                 "action": "edit",
                 "doc_id": target_id,
                 "title": doc.title,
@@ -523,6 +524,7 @@ class EditDocumentTool:
                 "applied": applied,
                 "skipped": skipped,
             }
+            return result
         except Exception as e:
             db.rollback()
             return {"error": f"Failed to edit document: {e}"}
