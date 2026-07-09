@@ -1,10 +1,11 @@
-"""Agent tools for Nextcloud Files (read-only).
+"""Agent tools for Nextcloud Files (read/write).
 
-``nextcloud_list`` lists the children of a path on the user's Nextcloud, and
-``nextcloud_read_file`` reads a text file into the agent's context. Both resolve
-the owner from the tool ``ctx`` and use that owner's first configured Nextcloud
-account (or a specific account id when provided). Credentials are never put in
-tool output.
+``nextcloud_list`` lists the children of a path on the user's Nextcloud,
+``nextcloud_read_file`` reads a text file into the agent's context, and
+``nextcloud_write_file`` writes/creates/deletes files on Nextcloud. All
+resolve the owner from the tool ``ctx`` and use that owner's first configured
+Nextcloud account (or a specific account id when provided). Credentials are
+never put in tool output.
 """
 
 import asyncio
@@ -179,3 +180,45 @@ class NextcloudReadFileTool:
             text = text[:NEXTCLOUD_MAX_READ_CHARS] + f"\n... [truncated at {NEXTCLOUD_MAX_READ_CHARS} chars]"
         header = f"[nextcloud:{label}] {path}"
         return {"output": f"{header}\n{text}", "exit_code": 0}
+
+
+class NextcloudWriteFileTool:
+    """Write, create folders, or delete files on Nextcloud via WebDAV."""
+
+    async def execute(self, content: str, ctx: dict) -> dict:
+        args = _parse_args(content)
+        action = str(args.get("action") or "").strip().lower()
+        path = str(args.get("path") or "").strip()
+        account_id = str(args.get("account") or "").strip()
+        text_content = args.get("content")
+
+        if not action:
+            return {"error": "nextcloud_write_file: action required (write, mkdir, delete)", "exit_code": 1}
+        if action not in ("write", "mkdir", "delete"):
+            return {"error": f"nextcloud_write_file: unknown action '{action}' — use write, mkdir, or delete", "exit_code": 1}
+        if not path:
+            return {"error": "nextcloud_write_file: path required", "exit_code": 1}
+
+        client, label, err = _resolve_client(ctx, account_id)
+        if err:
+            return {"error": f"nextcloud_write_file: {err}", "exit_code": 1}
+
+        try:
+            if action == "write":
+                if text_content is None:
+                    return {"error": "nextcloud_write_file: content required for write action", "exit_code": 1}
+                await asyncio.to_thread(client.put_file, path, str(text_content).encode("utf-8"))
+                return {"output": f"nextcloud: {label} — wrote {len(str(text_content))} chars to {path}", "exit_code": 0}
+
+            if action == "mkdir":
+                await asyncio.to_thread(client.mkcol, path)
+                return {"output": f"nextcloud: {label} — created folder {path}", "exit_code": 0}
+
+            # action == "delete"
+            await asyncio.to_thread(client.delete, path)
+            return {"output": f"nextcloud: {label} — deleted {path}", "exit_code": 0}
+
+        except NextcloudError as e:
+            return {"error": f"nextcloud_write_file: {e}", "exit_code": 1}
+        except ValueError as e:
+            return {"error": f"nextcloud_write_file: {e}", "exit_code": 1}

@@ -319,4 +319,170 @@ async def test_read_file_tool_pdf_extraction_failure_is_graceful(app, monkeypatc
     assert "error" in res or "output" in res
 
 
+# ── Write tool: nextcloud_write_file ──
+
+class _FakeWriteClient:
+    """Stub client that records put_file / mkcol / delete calls."""
+
+    def __init__(self):
+        self.written = []   # [(path, content_bytes)]
+        self.mkdired = []   # [path]
+        self.deleted = []   # [path]
+
+    def put_file(self, path, content):
+        self.written.append((path, content))
+
+    def mkcol(self, path):
+        self.mkdired.append(path)
+
+    def delete(self, path):
+        self.deleted.append(path)
+
+
+async def test_write_file_action_writes_content(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    fake = _FakeWriteClient()
+    monkeypatch.setattr(nc, "_client_for", lambda account: fake)
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","path":"notes/todo.txt","content":"buy milk"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 0
+    assert "wrote" in res["output"]
+    assert len(fake.written) == 1
+    assert fake.written[0][0] == "notes/todo.txt"
+    assert fake.written[0][1] == b"buy milk"
+
+
+async def test_write_file_action_requires_content(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    monkeypatch.setattr(nc, "_client_for", lambda account: _FakeWriteClient())
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","path":"notes/todo.txt"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "content required" in res["error"]
+
+
+async def test_mkdir_action_creates_folder(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    fake = _FakeWriteClient()
+    monkeypatch.setattr(nc, "_client_for", lambda account: fake)
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"mkdir","path":"Projects/new-folder"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 0
+    assert "created folder" in res["output"]
+    assert fake.mkdired == ["Projects/new-folder"]
+
+
+async def test_delete_action_removes_file(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    fake = _FakeWriteClient()
+    monkeypatch.setattr(nc, "_client_for", lambda account: fake)
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"delete","path":"old-draft.txt"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 0
+    assert "deleted" in res["output"]
+    assert fake.deleted == ["old-draft.txt"]
+
+
+async def test_write_file_requires_action(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    res = await NextcloudWriteFileTool().execute('{"path":"x.txt"}', {"owner": "alice"})
+    assert res["exit_code"] == 1
+    assert "action required" in res["error"]
+
+
+async def test_write_file_rejects_unknown_action(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"append","path":"x.txt","content":"hi"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "unknown action" in res["error"]
+
+
+async def test_write_file_requires_path(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","content":"hi"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "path required" in res["error"]
+
+
+async def test_write_file_no_account_shows_error(app, monkeypatch):
+    """When no Nextcloud account is configured, the tool returns a helpful error."""
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    # No account created — _load_accounts returns []
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","path":"x.txt","content":"hi"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "No Nextcloud account" in res["error"]
+
+
+async def test_write_file_tool_registered_in_handlers():
+    """The tool is importable and registered in TOOL_HANDLERS."""
+    from src.agent_tools import TOOL_HANDLERS
+    assert "nextcloud_write_file" in TOOL_HANDLERS
+
+
+async def test_write_file_schema_exists():
+    """The schema is present in FUNCTION_TOOL_SCHEMAS."""
+    from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+    names = [s["function"]["name"] for s in FUNCTION_TOOL_SCHEMAS]
+    assert "nextcloud_write_file" in names
+    schema = next(s for s in FUNCTION_TOOL_SCHEMAS if s["function"]["name"] == "nextcloud_write_file")
+    props = schema["function"]["parameters"]["properties"]
+    assert "action" in props
+    assert props["action"]["enum"] == ["write", "mkdir", "delete"]
+    assert "path" in props
+    assert "content" in props
+    assert schema["function"]["parameters"]["required"] == ["action", "path"]
+
+
 

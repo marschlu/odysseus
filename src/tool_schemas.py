@@ -184,6 +184,23 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "nextcloud_write_file",
+            "description": "Write, create folders, or delete files on Nextcloud / ownCloud via WebDAV. Supports three actions: 'write' (create or overwrite a text file), 'mkdir' (create a folder), 'delete' (remove a file or folder). Use when the user asks to save, write, create, upload, or delete files on their Nextcloud. Text only (use the document editor flow for binary files).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["write", "mkdir", "delete"], "description": "write = create or overwrite a file, mkdir = create a folder, delete = remove a file or folder"},
+                    "path": {"type": "string", "description": "File or folder path relative to the user's Nextcloud home"},
+                    "content": {"type": "string", "description": "Text content to write (required for write action; ignored for mkdir/delete)"},
+                    "account": {"type": "string", "description": "Specific Nextcloud account id (optional; defaults to the first configured account)"}
+                },
+                "required": ["action", "path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
             "description": "Write/save a file to disk",
             "parameters": {
