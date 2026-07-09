@@ -1,5 +1,6 @@
 """Document routes — CRUD for living documents with version history."""
 
+import asyncio
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -485,7 +486,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             head_re = re.compile(r'^(<!--[^>]+-->\s*\n+#[^\n]*\n+)', re.MULTILINE)
             head_match = head_re.match(content)
             head = head_match.group(1) if head_match else (content.splitlines()[0] + "\n\n# " + (doc.title or "PDF") + "\n\n")
-            doc.current_content = head + body_text.strip() + "\n"
+            new_content = head + body_text.strip() + "\n"
+            if doc.current_content == new_content:
+                return {"ok": True, "id": doc_id, "extracted": False, "reason": "Content unchanged — no new version needed"}
+            doc.current_content = new_content
             doc.version_count = (doc.version_count or 1) + 1
             db.add(DocumentVersion(
                 id=str(__import__("uuid").uuid4()),
@@ -618,6 +622,13 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             doc.current_content = req.content
             db.commit()
             db.refresh(doc)
+
+            # ── Fire-and-forget Nextcloud writeback ──
+            if doc.source_nextcloud_account and doc.source_nextcloud_path:
+                from routes.nextcloud_routes import _writeback_nextcloud_doc
+                user_for_wb = get_current_user(request)
+                asyncio.ensure_future(_writeback_nextcloud_doc(doc.id, req.content, user_for_wb or ""))
+
             result = _doc_to_dict(doc)
             return result
         except HTTPException:

@@ -1,7 +1,8 @@
-// nextcloud.js — read-only Nextcloud Files explorer.
+// nextcloud.js — Nextcloud Files explorer with inline open-in-asset support.
 //
 // Opens a modal file browser over /api/nextcloud/* (added in routes/nextcloud_routes.py).
-// Files open in a new tab or the inline image viewer — no editing or writeback.
+// Text/code files can be opened in the document editor, PDFs in the PDF viewer, and
+// images in the Gallery via /api/nextcloud/open-in-asset.
 // Self-contained: it builds its DOM with createElement/textContent so untrusted
 // file/folder names from the server can't inject markup, reuses the app's CSS
 // variables (--panel/--border/--fg/--accent) and inline monochrome SVG icons,
@@ -17,6 +18,9 @@ function _ncIcon(name) {
     close: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
     download: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
     back: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>',
+    edit: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="M15 5l4 4"/></svg>',
+    eye: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+    image: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>',
   };
   return icons[name] || '';
 }
@@ -45,7 +49,22 @@ function _ncIsImage(entry) {
   return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].indexOf((entry.name.split('.').pop() || '').toLowerCase()) !== -1;
 }
 
-// Read-only in-app viewer for images. Office/PDF/text files open in a new tab.
+function _ncIsText(entry) {
+  var ct = (entry.content_type || '').toLowerCase();
+  // Content-type based detection
+  if (ct.startsWith('text/')) return true;
+  if (['application/json', 'application/xml', 'application/javascript',
+       'application/x-yaml', 'application/x-python', 'application/x-shellscript'
+      ].indexOf(ct) !== -1) return true;
+  // Extension-based detection for common text/code files
+  var exts = ['py', 'js', 'ts', 'md', 'txt', 'html', 'css', 'json', 'yaml', 'yml',
+              'xml', 'csv', 'sh', 'bash', 'sql', 'rs', 'go', 'java', 'c', 'cpp',
+              'rb', 'php', 'toml', 'ini'];
+  var ext = (entry.name.split('.').pop() || '').toLowerCase();
+  return exts.indexOf(ext) !== -1;
+}
+
+// In-app viewer for images. Now renders via the Gallery asset flow.
 function _ncOpenViewer(accountId, entry) {
   const url = _ncFileUrl(accountId, entry.path);
   const backdrop = document.createElement('div');
@@ -92,9 +111,89 @@ function _ncOpenViewer(accountId, entry) {
   }
 }
 
+// Open a Nextcloud file in the appropriate Odysseus asset (editor/viewer/gallery).
+function _ncOpenInAsset(accountId, entry) {
+  var sessionId = '';
+  try {
+    // Try to read the current session from the session module (dynamic import).
+    if (window.sessionModule && window.sessionModule.getCurrentSessionId) {
+      sessionId = window.sessionModule.getCurrentSessionId() || '';
+    }
+  } catch (_) {}
+
+  return fetch('/api/nextcloud/open-in-asset', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      account_id: accountId,
+      path: entry.path,
+      session_id: sessionId || undefined
+    })
+  })
+  .then(function(r) {
+    if (!r.ok) {
+      return r.json().then(function(d) {
+        throw new Error(d.detail || d.error || ('HTTP ' + r.status));
+      });
+    }
+    return r.json();
+  })
+  .then(function(data) {
+    if (data.type === 'document' && data.document) {
+      // Inject the document directly into the editor tabs — no re-fetch needed
+      // since the API response already includes the full document dict. Stamps
+      // _ocrTriggered so the PDF viewer doesn't re-run OCR on open (text was
+      // already extracted during import).
+      var docData = data.document;
+      docData._ocrTriggered = true;
+      import('./document.js').then(function(mod) {
+        var inject = mod.injectFreshDoc
+          || (mod.default && mod.default.injectFreshDoc);
+        if (inject) {
+          inject(docData);
+        } else {
+          // Fallback: use loadDocument (will re-fetch)
+          var load = mod.loadDocument || (mod.default && mod.default.loadDocument);
+          if (load) load(docData.id);
+        }
+      }).catch(function() {
+        if (window.documentModule && window.documentModule.injectFreshDoc) {
+          window.documentModule.injectFreshDoc(docData);
+        } else if (window.documentModule && window.documentModule.loadDocument) {
+          window.documentModule.loadDocument(docData.id);
+        }
+      });
+    } else if (data.type === 'gallery_image' && data.image) {
+      // Open the Gallery — the imported image appears in the grid.
+      import('./gallery.js').then(function(mod) {
+        var openGallery = mod.openGallery
+          || (mod.default && mod.default.openGallery);
+        if (openGallery) openGallery();
+      }).catch(function() {
+        // Fallback: try window.galleryModule
+        if (window.galleryModule && window.galleryModule.openGallery) {
+          window.galleryModule.openGallery();
+        }
+      });
+    }
+  })
+  .catch(function(err) {
+    // Show error via UI module if available
+    if (window.uiModule && window.uiModule.showError) {
+      window.uiModule.showError('Failed to open file: ' + (err.message || err));
+    } else {
+      alert('Failed to open file: ' + (err.message || err));
+    }
+  });
+}
+
 function _ncOpenFile(accountId, entry) {
-  if (_ncIsImage(entry)) return _ncOpenViewer(accountId, entry);  // image → inline viewer
-  window.open(_ncFileUrl(accountId, entry.path), '_blank');       // everything else → new tab
+  // Route to the appropriate Odysseus asset viewer.
+  if (_ncIsText(entry)) return _ncOpenInAsset(accountId, entry);  // text/code → document editor
+  if (_ncIsPdf(entry))  return _ncOpenInAsset(accountId, entry);  // PDF → PDF viewer
+  if (_ncIsImage(entry)) return _ncOpenInAsset(accountId, entry); // image → Gallery
+  window.open(_ncFileUrl(accountId, entry.path), '_blank');       // other → new tab
 }
 
 async function _ncFetchList(accountId, path) {
@@ -204,9 +303,20 @@ window.openNextcloudExplorer = function (accountId, label) {
         body.appendChild(empty);
         return;
       }
+      const _makeActionBtn = (entry, iconName, title, onClick) => {
+        const btn = document.createElement('button');
+        btn.title = title;
+        btn.style.cssText = 'background:color-mix(in srgb, var(--accent,var(--red)) 12%, transparent);border:1px solid color-mix(in srgb, var(--accent,var(--red)) 30%, transparent);color:var(--accent,var(--red));cursor:pointer;padding:3px 8px;display:inline-flex;align-items:center;gap:4px;border-radius:4px;font:inherit;font-size:11px;flex-shrink:0;white-space:nowrap;transition:background .15s,border-color .15s;';
+        btn.innerHTML = _ncIcon(iconName) + '<span style="margin-left:1px">' + title + '</span>';
+        btn.onmouseenter = function() { btn.style.background = 'color-mix(in srgb, var(--accent,var(--red)) 22%, transparent)'; btn.style.borderColor = 'var(--accent,var(--red))'; };
+        btn.onmouseleave = function() { btn.style.background = 'color-mix(in srgb, var(--accent,var(--red)) 12%, transparent)'; btn.style.borderColor = 'color-mix(in srgb, var(--accent,var(--red)) 30%, transparent)'; };
+        btn.onclick = function(e) { e.stopPropagation(); onClick(); };
+        return btn;
+      };
+
       const rowFor = (entry) => {
         const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:6px;cursor:pointer;';
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:6px;cursor:pointer;';
         const ico = document.createElement('span');
         ico.style.cssText = 'display:inline-flex;color:var(--accent,var(--red));opacity:0.8;flex-shrink:0;';
         ico.innerHTML = entry.is_dir ? _ncIcon('folder') : _ncIcon('file');
@@ -219,6 +329,18 @@ window.openNextcloudExplorer = function (accountId, label) {
         row.appendChild(ico);
         row.appendChild(name);
         row.appendChild(meta);
+
+        // Action buttons for supported file types
+        if (!entry.is_dir) {
+          if (_ncIsText(entry)) {
+            row.appendChild(_makeActionBtn(entry, 'edit', 'Open in editor', () => _ncOpenInAsset(accountId, entry)));
+          } else if (_ncIsPdf(entry)) {
+            row.appendChild(_makeActionBtn(entry, 'eye', 'Open in viewer', () => _ncOpenInAsset(accountId, entry)));
+          } else if (_ncIsImage(entry)) {
+            row.appendChild(_makeActionBtn(entry, 'image', 'Open in gallery', () => _ncOpenInAsset(accountId, entry)));
+          }
+        }
+
         row.onmouseenter = () => { row.style.background = 'color-mix(in srgb, var(--fg) 8%, transparent)'; };
         row.onmouseleave = () => { row.style.background = 'transparent'; };
         if (entry.is_dir) {
@@ -275,6 +397,23 @@ function _ncFileNode(accountId, entry, depth) {
   meta.style.cssText = 'opacity:0.5;font-size:11px;flex-shrink:0;';
   meta.textContent = _ncHumanSize(entry.size);
   row.appendChild(spacer); row.appendChild(ico); row.appendChild(name); row.appendChild(meta);
+
+  // Action button for supported types
+  var actTitle, actIcon;
+  if (_ncIsText(entry))  { actTitle = 'Open in editor'; actIcon = 'edit'; }
+  if (_ncIsPdf(entry))   { actTitle = 'Open in viewer'; actIcon = 'eye'; }
+  if (_ncIsImage(entry)) { actTitle = 'Open in gallery'; actIcon = 'image'; }
+  if (actIcon) {
+    var btn = document.createElement('button');
+    btn.title = actTitle;
+    btn.style.cssText = 'background:color-mix(in srgb, var(--accent,var(--red)) 12%, transparent);border:1px solid color-mix(in srgb, var(--accent,var(--red)) 30%, transparent);color:var(--accent,var(--red));cursor:pointer;padding:2px 6px;display:inline-flex;align-items:center;gap:3px;border-radius:4px;font:inherit;font-size:10px;flex-shrink:0;white-space:nowrap;transition:background .15s,border-color .15s;margin-left:6px;';
+    btn.innerHTML = _ncIcon(actIcon);
+    btn.onmouseenter = function() { btn.style.background = 'color-mix(in srgb, var(--accent,var(--red)) 22%, transparent)'; btn.style.borderColor = 'var(--accent,var(--red))'; };
+    btn.onmouseleave = function() { btn.style.background = 'color-mix(in srgb, var(--accent,var(--red)) 12%, transparent)'; btn.style.borderColor = 'color-mix(in srgb, var(--accent,var(--red)) 30%, transparent)'; };
+    btn.onclick = function(e) { e.stopPropagation(); _ncOpenInAsset(accountId, entry); };
+    row.appendChild(btn);
+  }
+
   _ncHover(row);
   row.onclick = () => _ncOpenFile(accountId, entry);
   return row;

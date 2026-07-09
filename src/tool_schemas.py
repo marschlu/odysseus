@@ -155,7 +155,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "nextcloud_list",
-            "description": "List the files and folders at a path on the user's configured Nextcloud (via WebDAV). Use when the user refers to files on their Nextcloud/ownCloud instance. Read-only. Path is relative to the user's Nextcloud home; omit it to list the root. Folders are shown with a trailing slash.",
+            "description": "Access Nextcloud / ownCloud files: list the files and folders at a path on the user's configured Nextcloud via WebDAV (read-only). Use when the user asks about accessing, finding, or browsing files on their Nextcloud instance. Path is relative to the Nextcloud home; omit it to list the root. Folders shown with trailing slash.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -170,7 +170,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "nextcloud_read_file",
-            "description": "Read a text file from the user's configured Nextcloud into context (via WebDAV GET). Use when the user asks you to read/open/summarize a file that lives on their Nextcloud/ownCloud. The content is capped (configurable); binary files may not be useful. Read-only.",
+            "description": "Access Nextcloud / ownCloud file content: read a file from the user's configured Nextcloud into context via WebDAV GET (read-only). Use when the user asks to access, read, open, summarize, or show a file that lives on their Nextcloud. Supports plain-text and PDF files; content is capped.",
             "parameters": {
                 "type": "object",
                 "properties": {

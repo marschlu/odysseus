@@ -8,11 +8,12 @@ tool output.
 """
 
 import asyncio
+import io
 import json
 import logging
 from typing import Optional, Tuple
 
-from src.constants import NEXTCLOUD_MAX_READ_CHARS
+from src.constants import NEXTCLOUD_MAX_READ_CHARS, NEXTCLOUD_MAX_DOWNLOAD_BYTES
 from src.nextcloud_client import NextcloudError
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,44 @@ def _human_size(n: Optional[int]) -> str:
     return f"{int(f)} TB"
 
 
+def _extract_pdf_text(content_bytes: bytes) -> str:
+    """Extract text from PDF bytes, trying PyMuPDF (optional) then pypdf (core).
+
+    Returns the extracted text or an empty string if extraction fails.
+    """
+    # 1. Try PyMuPDF (optional, AGPL — may not be installed)
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=content_bytes, filetype="pdf")
+        text = "\n".join(page.get_text() for page in doc)
+        doc.close()
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    # 2. Try pypdf (core dependency, BSD — always available)
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(content_bytes))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        if text.strip():
+            return text
+    except ImportError:
+        logger.warning("pypdf not available — cannot extract PDF text")
+    except Exception as e:
+        logger.warning(f"pypdf extraction failed: {e}")
+
+    # 3. Fallback: raw UTF-8 decode (for PDFs that are mostly text)
+    try:
+        raw = content_bytes.decode("utf-8", errors="replace")
+        return raw
+    except Exception:
+        pass
+
+    return ""
+
+
 class NextcloudListTool:
     async def execute(self, content: str, ctx: dict) -> dict:
         args = _parse_args(content)
@@ -108,15 +147,30 @@ class NextcloudReadFileTool:
         if err:
             return {"error": f"nextcloud_read_file: {err}", "exit_code": 1}
         name = path.rsplit("/", 1)[-1]
-        budget = NEXTCLOUD_MAX_READ_CHARS * 4
+        ext = (name.split(".")[-1] if "." in name else "").lower()
+        # PDFs can be large binary files but contain little text — use the
+        # generous 50 MB download budget so the file can be downloaded and
+        # text extracted. The extracted text is then truncated to the read
+        # char limit. Other files use the smaller budget.
+        is_pdf_ext = (ext == "pdf")
+        budget = NEXTCLOUD_MAX_DOWNLOAD_BYTES if is_pdf_ext else NEXTCLOUD_MAX_READ_CHARS * 4
         try:
-            content_bytes, _ = await asyncio.to_thread(client.get_file, path, budget)
+            content_bytes, content_type = await asyncio.to_thread(client.get_file, path, budget)
         except NextcloudError as e:
             return {"error": f"nextcloud_read_file: {e}", "exit_code": 1}
         except ValueError as e:
             return {"error": f"nextcloud_read_file: {e}", "exit_code": 1}
-        ext = (name.split(".")[-1] if "." in name else "").lower()
-        if ext in {"pdf", "docx", "pptx", "xlsx", "xls", "epub", "odt", "ods", "odp"}:
+        is_pdf_ct = (content_type or "").lower() == "application/pdf"
+        is_pdf = is_pdf_ext or is_pdf_ct
+        if is_pdf:
+            text = _extract_pdf_text(content_bytes)
+            if not text.strip():
+                return {"error": f"nextcloud_read_file: could not extract text from PDF {name}", "exit_code": 1}
+            if len(text) > NEXTCLOUD_MAX_READ_CHARS:
+                text = text[:NEXTCLOUD_MAX_READ_CHARS] + f"\n... [truncated at {NEXTCLOUD_MAX_READ_CHARS} chars]"
+            header = f"[nextcloud:{label}] {path}"
+            return {"output": f"{header}\n{text}", "exit_code": 0}
+        if ext in {"docx", "pptx", "xlsx", "xls", "epub", "odt", "ods", "odp"}:
             return {"error": f"nextcloud_read_file: cannot read binary file {name} — file viewer available in the Nextcloud explorer.", "exit_code": 1}
         text = content_bytes.decode("utf-8", errors="replace")
         if not text.strip():

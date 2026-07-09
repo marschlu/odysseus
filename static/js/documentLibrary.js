@@ -561,6 +561,18 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
     verBadge.style.cssText = 'font-size:9px;padding:1px 6px;border-radius:8px;background:color-mix(in srgb, var(--red) 15%, transparent);border:1px solid color-mix(in srgb, var(--red) 40%, transparent);color:var(--red);flex-shrink:0;';
     verBadge.textContent = 'v' + (doc.version_count || 1);
     titleRow.appendChild(verBadge);
+    // Nextcloud sync error badge — shows a warning icon next to the title
+    // when a Nextcloud-sourced document had its last sync (writeback or
+    // periodic pull) fail.  The "synced" state is the normal case and shows
+    // nothing; only the error state is flagged.
+    if (doc.source_nextcloud_account && doc.nextcloud_sync_status === 'error') {
+      const ncBadge = document.createElement('span');
+      ncBadge.style.cssText = 'flex-shrink:0;display:inline-flex;align-items:center;color:var(--yellow);opacity:0.85;';
+      ncBadge.title = 'Nextcloud sync error: ' + _esc(doc.nextcloud_sync_error || 'unknown');
+      // Triangle-exclamation warning icon (inline SVG, no emoji).
+      ncBadge.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+      titleRow.appendChild(ncBadge);
+    }
     // Chevron pushed to the right end of the title row — collapsed
     // shows nothing, expanded reveals a downward chevron so the user
     // sees the card is open and can tap to close it.
@@ -776,7 +788,7 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
     const pre = document.createElement('pre');
     const code = document.createElement('code');
     try {
-      if (doc.language && doc.language !== 'text' && window.hljs && !_librarySearch) {
+      if (doc.language && doc.language !== 'text' && window.hljs && window.hljs.getLanguage(doc.language) && !_librarySearch) {
         code.innerHTML = window.hljs.highlight(doc.preview || '', { language: doc.language }).value;
       } else if (_librarySearch) {
         // While searching, highlight matched terms in the preview (plain
@@ -955,7 +967,7 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
       // highlighting anyway, so skip it there.
       const HL_CAP = 20000;
       try {
-        if (lang && lang !== 'text' && lang !== 'markdown' && window.hljs && content.length <= HL_CAP) {
+        if (lang && lang !== 'text' && lang !== 'markdown' && window.hljs && window.hljs.getLanguage(lang) && content.length <= HL_CAP) {
           code.innerHTML = window.hljs.highlight(content, { language: lang }).value;
         } else {
           code.textContent = content;
