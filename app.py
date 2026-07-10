@@ -65,6 +65,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from core.constants import (
     BASE_DIR, STATIC_DIR, SESSIONS_FILE,
     REQUEST_TIMEOUT, OPENAI_API_KEY, AUTH_FILE,
+    NEXTCLOUD_SYNC_INTERVAL_SECONDS,
 )
 from core.database import SessionLocal, ApiToken
 from core.middleware import SecurityHeadersMiddleware, is_cors_preflight
@@ -854,9 +855,9 @@ app.include_router(setup_vault_routes())
 from routes.contacts.contacts_routes import setup_contacts_routes
 app.include_router(setup_contacts_routes())
 
-# Nextcloud Files (read-only WebDAV explorer)
+# Nextcloud Files (WebDAV explorer + open-in-asset)
 from routes.nextcloud_routes import setup_nextcloud_routes
-app.include_router(setup_nextcloud_routes())
+app.include_router(setup_nextcloud_routes(upload_handler))
 
 from companion import setup_companion_routes
 app.include_router(setup_companion_routes())
@@ -1242,6 +1243,20 @@ async def _startup_event():
     # removes the feature.
     from src.cookbook_serve_lifecycle import cookbook_serve_lifecycle_loop
     _startup_tasks.append(asyncio.create_task(cookbook_serve_lifecycle_loop()))
+
+    # Start periodic Nextcloud document sync — polls for remote changes and
+    # pulls newer content into a fresh DocumentVersion (best-effort, never
+    # blocks the event loop).
+    async def _nextcloud_sync_loop():
+        while True:
+            await asyncio.sleep(NEXTCLOUD_SYNC_INTERVAL_SECONDS)
+            try:
+                from src.nextcloud_sync import sync_nextcloud_documents
+                await sync_nextcloud_documents()
+            except Exception:
+                logger.exception("Nextcloud sync loop error")
+
+    _startup_tasks.append(asyncio.create_task(_nextcloud_sync_loop()))
 
     logger.info("Application startup complete")
 

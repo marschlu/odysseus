@@ -119,6 +119,9 @@ def _image_to_dict(img: GalleryImage, session_name: str = None) -> Dict[str, Any
         "file_size": img.file_size,
         "created_at": img.created_at.isoformat() if img.created_at else None,
         "updated_at": img.updated_at.isoformat() if img.updated_at else None,
+        # Nextcloud provenance (set when imported from a Nextcloud file)
+        "source_nextcloud_account": getattr(img, "source_nextcloud_account", None),
+        "source_nextcloud_path": getattr(img, "source_nextcloud_path", None),
     }
 
 

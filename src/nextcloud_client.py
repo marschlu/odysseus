@@ -1,7 +1,7 @@
-"""Nextcloud WebDAV client (read-only).
+"""Nextcloud WebDAV client (read-write).
 
-Live browsing of a user's Nextcloud files over WebDAV. Every listing and file
-read hits the server on demand — there is no local mirror — mirroring how
+Live browsing, reading, and writing of a user's Nextcloud files over WebDAV.
+Every operation hits the server on demand — there is no local mirror — mirroring how
 ``src/caldav_sync.py`` talks to a remote CalDAV server.
 
 Design notes:
@@ -34,6 +34,7 @@ from defusedxml import ElementTree as ET
 
 from src.constants import (
     NEXTCLOUD_DAV_PATH,
+    NEXTCLOUD_PUT_TIMEOUT,
     NEXTCLOUD_REQUEST_TIMEOUT,
 )
 from src.url_safety import check_outbound_url
@@ -317,6 +318,93 @@ class NextcloudClient:
                 return b"".join(chunks), content_type
         except httpx.HTTPError as e:
             raise NextcloudError(f"Nextcloud request failed: {e}") from e
+
+    def put_file(self, path: str, content: bytes) -> None:
+        """Upsert file content at *path* (relative to the user's DAV home).
+
+        Issues a WebDAV PUT, creating or overwriting the remote file. Returns
+        ``None`` on success; raises ``NextcloudError`` on HTTP/transport errors.
+        """
+        url = self._dav_url(path)
+        try:
+            r = httpx.request(
+                "PUT", url,
+                content=content,
+                auth=self._auth,
+                timeout=self.timeout,
+            )
+        except httpx.HTTPError as e:
+            raise NextcloudError(f"Nextcloud request failed: {e}") from e
+        if r.status_code == 401:
+            raise NextcloudError("Nextcloud rejected the credentials (401).", status=401)
+        if r.status_code == 404:
+            raise NextcloudError("That path does not exist on Nextcloud (404).", status=404)
+        if r.status_code >= 400:
+            raise NextcloudError(f"Nextcloud returned HTTP {r.status_code}.", status=r.status_code)
+        # 2xx → success
+        return None
+
+    def mkcol(self, path: str) -> None:
+        """Create a directory tree at *path* (relative to the user's DAV home).
+
+        Issues WebDAV MKCOL requests. Intermediate parent directories are
+        created recursively. A 409 (AlreadyExists) for any segment is silently
+        ignored. Raises ``NextcloudError`` on other HTTP/transport errors.
+        """
+        # Walk path segments from the root downward, creating each as we go.
+        segments = _safe_relative_path(path).split("/") if _safe_relative_path(path) else []
+        # No-op when the path is empty or the root.
+        if not segments:
+            return
+        accumulated = ""
+        for seg in segments:
+            accumulated = f"{accumulated}/{seg}" if accumulated else seg
+            url = self._dav_url(accumulated)
+            try:
+                r = httpx.request(
+                    "MKCOL", url,
+                    auth=self._auth,
+                    timeout=self.timeout,
+                )
+            except httpx.HTTPError as e:
+                raise NextcloudError(f"Nextcloud request failed: {e}") from e
+            if r.status_code == 409:
+                # Directory already exists — continue to next segment.
+                continue
+            if r.status_code == 401:
+                raise NextcloudError("Nextcloud rejected the credentials (401).", status=401)
+            if r.status_code >= 400:
+                raise NextcloudError(
+                    f"Nextcloud returned HTTP {r.status_code} for MKCOL {accumulated!r}.",
+                    status=r.status_code,
+                )
+            # 2xx (or 201 Created) → created, continue.
+
+    def delete(self, path: str) -> None:
+        """Remove a file at *path* (relative to the user's DAV home).
+
+        Issues a WebDAV DELETE. If the file does not exist (404) the error is
+        silently ignored for idempotency. Raises ``NextcloudError`` on other
+        HTTP/transport errors.
+        """
+        url = self._dav_url(path)
+        try:
+            r = httpx.request(
+                "DELETE", url,
+                auth=self._auth,
+                timeout=self.timeout,
+            )
+        except httpx.HTTPError as e:
+            raise NextcloudError(f"Nextcloud request failed: {e}") from e
+        if r.status_code == 401:
+            raise NextcloudError("Nextcloud rejected the credentials (401).", status=401)
+        if r.status_code == 404:
+            # Idempotent — file already gone is not an error.
+            return None
+        if r.status_code >= 400:
+            raise NextcloudError(f"Nextcloud returned HTTP {r.status_code}.", status=r.status_code)
+        # 2xx → success
+        return None
 
 
 def _parse_single_propfind(xml_text: str, username: str, requested_rel: str) -> Optional[dict]:

@@ -311,6 +311,11 @@ class GalleryImage(TimestampMixin, Base):
     height         = Column(Integer, nullable=True)
     file_size      = Column(Integer, nullable=True)  # bytes
 
+    # Nextcloud provenance: set when the image was imported from a Nextcloud file.
+    # Parallels the Document model's source_nextcloud_account / source_nextcloud_path.
+    source_nextcloud_account = Column(String, nullable=True, index=True)
+    source_nextcloud_path    = Column(String, nullable=True)
+
     session = relationship("Session", backref=backref("gallery_images"))
     album   = relationship("GalleryAlbum", back_populates="images")
 
@@ -826,6 +831,50 @@ def _migrate_add_nextcloud_document_columns():
             logging.getLogger(__name__).info("Migrated: added Nextcloud columns to documents")
     except Exception as e:
         logging.getLogger(__name__).warning(f"documents.nextcloud migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_add_nextcloud_gallery_columns():
+    """Add Nextcloud provenance columns to gallery_images.
+
+    Guarded + idempotent (each column is added only if missing), so it is safe
+    on existing databases and a no-op on fresh ones (create_all already makes
+    them). Supports the Gallery "Open in gallery" flow for Nextcloud images.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(gallery_images)")}
+        adds = {
+            "source_nextcloud_account": "VARCHAR",
+            "source_nextcloud_path": "VARCHAR",
+        }
+        changed = False
+        for col, typ in adds.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE gallery_images ADD COLUMN {col} {typ}")
+                changed = True
+        if "source_nextcloud_account" not in existing:
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_gallery_images_source_nextcloud_account "
+                    "ON gallery_images(source_nextcloud_account)"
+                )
+            except Exception:
+                pass
+        if changed:
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added Nextcloud columns to gallery_images")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"gallery_images.nextcloud migration failed: {e}")
     finally:
         try:
             conn.close()
@@ -1890,6 +1939,7 @@ def init_db():
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()
     _migrate_add_nextcloud_document_columns()
+    _migrate_add_nextcloud_gallery_columns()
     _migrate_add_last_message_at_column()
     _migrate_add_folder_column()
     _migrate_add_token_columns()

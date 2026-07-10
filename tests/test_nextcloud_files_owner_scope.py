@@ -222,6 +222,7 @@ async def test_read_file_tool_returns_text(app, monkeypatch):
 
 
 async def test_read_file_tool_rejects_binary(app, monkeypatch):
+    """Non-PDF binary formats (docx, etc.) are still rejected."""
     from src.agent_tools.nextcloud_tools import NextcloudReadFileTool
 
     _as(app, "alice")
@@ -229,10 +230,259 @@ async def test_read_file_tool_rejects_binary(app, monkeypatch):
 
     class _C:
         def get_file(self, path, max_bytes=None):
-            return b"%PDF-1.4 (pretend bytes)", "application/pdf"
+            return b"binary bytes", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    monkeypatch.setattr(nc, "_client_for", lambda account: _C())
+    res = await NextcloudReadFileTool().execute('{"path":"reports/2024.docx"}', {"owner": "alice"})
+    assert res["exit_code"] == 1 and "cannot read binary file" in res["error"]
+
+
+# ── PDF extraction helpers ──
+
+def _make_minimal_pdf(text: str = "Hello PDF World") -> bytes:
+    """Build a minimal valid PDF with extractable text for use in tests."""
+    content = f"BT /F1 12 Tf 100 700 Td ({text}) Tj ET".encode()
+    obj4_len = len(content)
+    header = b"%PDF-1.4\n"
+    obj1 = b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    obj2 = b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    obj3 = b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
+    obj4 = f"4 0 obj<</Length {obj4_len}>>stream\n".encode() + content + b"\nendstream\nendobj\n"
+    obj5 = b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+    parts = [header, obj1, obj2, obj3, obj4, obj5]
+    body = b"".join(parts)
+    xref_start = len(body)
+    off0, off1, off2, off3, off4, off5 = 0, len(header), len(header) + len(obj1), len(header) + len(obj1) + len(obj2), len(header) + len(obj1) + len(obj2) + len(obj3), len(header) + len(obj1) + len(obj2) + len(obj3) + len(obj4)
+    xref = f"xref\n0 6\n{off0:010d} 65535 f \n{off1:010d} 00000 n \n{off2:010d} 00000 n \n{off3:010d} 00000 n \n{off4:010d} 00000 n \n{off5:010d} 00000 n \n".encode()
+    trailer = f"trailer<</Size 6/Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF".encode()
+    return body + xref + trailer
+
+
+# ── PDF extraction tests ──
+
+async def test_read_file_tool_extracts_pdf_text(app, monkeypatch):
+    """PDF files with .pdf extension are parsed and text is returned."""
+    from src.agent_tools.nextcloud_tools import NextcloudReadFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    pdf_bytes = _make_minimal_pdf("Hello PDF World")
+
+    class _C:
+        def get_file(self, path, max_bytes=None):
+            return pdf_bytes, "application/pdf"
 
     monkeypatch.setattr(nc, "_client_for", lambda account: _C())
     res = await NextcloudReadFileTool().execute('{"path":"reports/2024.pdf"}', {"owner": "alice"})
-    assert res["exit_code"] == 1 and "cannot read binary file" in res["error"]
+    assert res["exit_code"] == 0
+    assert "Hello PDF World" in res["output"]
+    assert "[nextcloud:" in res["output"]
+
+
+async def test_read_file_tool_extracts_pdf_by_content_type(app, monkeypatch):
+    """Files with content-type application/pdf are treated as PDF even without .pdf extension."""
+    from src.agent_tools.nextcloud_tools import NextcloudReadFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    pdf_bytes = _make_minimal_pdf("Content-Type PDF")
+
+    class _C:
+        def get_file(self, path, max_bytes=None):
+            return pdf_bytes, "application/pdf"
+
+    monkeypatch.setattr(nc, "_client_for", lambda account: _C())
+    res = await NextcloudReadFileTool().execute('{"path":"reports/report"}', {"owner": "alice"})
+    assert res["exit_code"] == 0
+    assert "Content-Type PDF" in res["output"]
+
+
+async def test_read_file_tool_pdf_extraction_failure_is_graceful(app, monkeypatch):
+    """When all PDF extraction methods fail, the tool returns an error without traceback."""
+    import src.agent_tools.nextcloud_tools as nt
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    class _C:
+        def get_file(self, path, max_bytes=None):
+            return b"\x00\x01\xFF\xFE", "application/pdf"
+
+    monkeypatch.setattr(nc, "_client_for", lambda account: _C())
+    res = await nt.NextcloudReadFileTool().execute('{"path":"reports/bad.pdf"}', {"owner": "alice"})
+    # Should not crash — returns a result dict gracefully
+    assert "exit_code" in res
+    # Either it extracts something (raw decode might work) or returns an error
+    # The key is no unhandled exception
+    assert "error" in res or "output" in res
+
+
+# ── Write tool: nextcloud_write_file ──
+
+class _FakeWriteClient:
+    """Stub client that records put_file / mkcol / delete calls."""
+
+    def __init__(self):
+        self.written = []   # [(path, content_bytes)]
+        self.mkdired = []   # [path]
+        self.deleted = []   # [path]
+
+    def put_file(self, path, content):
+        self.written.append((path, content))
+
+    def mkcol(self, path):
+        self.mkdired.append(path)
+
+    def delete(self, path):
+        self.deleted.append(path)
+
+
+async def test_write_file_action_writes_content(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    fake = _FakeWriteClient()
+    monkeypatch.setattr(nc, "_client_for", lambda account: fake)
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","path":"notes/todo.txt","content":"buy milk"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 0
+    assert "wrote" in res["output"]
+    assert len(fake.written) == 1
+    assert fake.written[0][0] == "notes/todo.txt"
+    assert fake.written[0][1] == b"buy milk"
+
+
+async def test_write_file_action_requires_content(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    monkeypatch.setattr(nc, "_client_for", lambda account: _FakeWriteClient())
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","path":"notes/todo.txt"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "content required" in res["error"]
+
+
+async def test_mkdir_action_creates_folder(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    fake = _FakeWriteClient()
+    monkeypatch.setattr(nc, "_client_for", lambda account: fake)
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"mkdir","path":"Projects/new-folder"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 0
+    assert "created folder" in res["output"]
+    assert fake.mkdired == ["Projects/new-folder"]
+
+
+async def test_delete_action_removes_file(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    fake = _FakeWriteClient()
+    monkeypatch.setattr(nc, "_client_for", lambda account: fake)
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"delete","path":"old-draft.txt"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 0
+    assert "deleted" in res["output"]
+    assert fake.deleted == ["old-draft.txt"]
+
+
+async def test_write_file_requires_action(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    res = await NextcloudWriteFileTool().execute('{"path":"x.txt"}', {"owner": "alice"})
+    assert res["exit_code"] == 1
+    assert "action required" in res["error"]
+
+
+async def test_write_file_rejects_unknown_action(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"append","path":"x.txt","content":"hi"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "unknown action" in res["error"]
+
+
+async def test_write_file_requires_path(app, monkeypatch):
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    _make_account(TestClient(app))
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","content":"hi"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "path required" in res["error"]
+
+
+async def test_write_file_no_account_shows_error(app, monkeypatch):
+    """When no Nextcloud account is configured, the tool returns a helpful error."""
+    from src.agent_tools.nextcloud_tools import NextcloudWriteFileTool
+
+    _as(app, "alice")
+    # No account created — _load_accounts returns []
+
+    res = await NextcloudWriteFileTool().execute(
+        '{"action":"write","path":"x.txt","content":"hi"}',
+        {"owner": "alice"},
+    )
+    assert res["exit_code"] == 1
+    assert "No Nextcloud account" in res["error"]
+
+
+async def test_write_file_tool_registered_in_handlers():
+    """The tool is importable and registered in TOOL_HANDLERS."""
+    from src.agent_tools import TOOL_HANDLERS
+    assert "nextcloud_write_file" in TOOL_HANDLERS
+
+
+async def test_write_file_schema_exists():
+    """The schema is present in FUNCTION_TOOL_SCHEMAS."""
+    from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+    names = [s["function"]["name"] for s in FUNCTION_TOOL_SCHEMAS]
+    assert "nextcloud_write_file" in names
+    schema = next(s for s in FUNCTION_TOOL_SCHEMAS if s["function"]["name"] == "nextcloud_write_file")
+    props = schema["function"]["parameters"]["properties"]
+    assert "action" in props
+    assert props["action"]["enum"] == ["write", "mkdir", "delete"]
+    assert "path" in props
+    assert "content" in props
+    assert schema["function"]["parameters"]["required"] == ["action", "path"]
+
 
 

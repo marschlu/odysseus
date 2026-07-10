@@ -42,6 +42,12 @@ ALWAYS_AVAILABLE = frozenset({
     "ask_user",
     # Write back to the active plan (tick steps done / revise) during execution.
     "update_plan",
+    # Nextcloud file access — always injected so the agent knows it can
+    # browse and read files from the user's configured Nextcloud accounts
+    # without needing the RAG picker to match "nextcloud" or "access".
+    "nextcloud_list",
+    "nextcloud_read_file",
+    "nextcloud_write_file",
 })
 
 # Tools that the Personal Assistant always has access to during scheduled
@@ -75,8 +81,9 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "grep": "Search file CONTENTS for a regex across a directory tree (ripgrep-backed, honours .gitignore). Returns file:line:match. Use to find where code/symbols/strings live — prefer over bash grep.",
     "glob": "Find FILES by glob pattern (e.g. '**/*.py'), newest first. Use to locate files by name/extension — prefer over bash find/ls.",
     "ls": "List a directory's entries (folders then files with sizes). Use to see what's in a folder — prefer over bash ls.",
-    "nextcloud_list": "List files and folders at a path on the user's configured Nextcloud / ownCloud (WebDAV, read-only). Use when the user refers to files, docs, or folders that live on their Nextcloud instance. Path is relative to the user's Nextcloud home; omit it to list the root.",
-    "nextcloud_read_file": "Read a text file from the user's configured Nextcloud / ownCloud into context (WebDAV GET, read-only). Use when the user asks to read, open, summarize, or show a file that lives on their Nextcloud. Content is capped (configurable); binary files are not supported.",
+    "nextcloud_list": "Access Nextcloud / ownCloud files: list files and folders at a path on the user's configured Nextcloud via WebDAV (read-only). Use when the user asks about accessing, finding, or browsing files on their Nextcloud instance, or refers to files/docs stored there. Path is relative to the Nextcloud home; omit it to list the root.",
+    "nextcloud_read_file": "Access Nextcloud / ownCloud file content: read a file from the user's configured Nextcloud into context via WebDAV GET (read-only). Use when the user asks to access, read, open, summarize, or show a file that lives on their Nextcloud. Supports plain-text and PDF files; content is capped (configurable).",
+    "nextcloud_write_file": "Write, create folders, or delete files on Nextcloud / ownCloud via WebDAV. Supports 'write' (create or overwrite text files), 'mkdir' (create folders), 'delete' (remove files/folders). Use when the user asks to save, write, create, or delete files on their Nextcloud. Text only (binary files go through the document editor flow).",
     "get_workspace": "Return the absolute path of the active workspace folder the user is working in. File tools are confined to it; the shell starts there but is not sandboxed. Call this first when the user refers to 'the project'/'the code'/'this folder' without giving a path, instead of asking them.",
     "write_file": "Write/create or fully rewrite a file ON DISK (source code, configs, project files). Use for new files or full rewrites — NOT create_document (editor panel) and NOT a bash heredoc.",
     "edit_file": "Edit an existing file ON DISK by exact string replacement (fix a bug, change a function). Shows a diff. The tool for changing files on disk — NOT edit_document (editor panel) and NOT bash sed/heredoc.",

@@ -41,6 +41,8 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 
   // Diff mode state
   let _diffModeActive = false;
+  // Nextcloud live poll
+  let _ncLivePollTimer = null;
   let _diffOldContent = null;
   let _diffNewContent = null;
   let _diffChunks = [];          // [{id, oldLines, newLines, startLine, resolved, accepted}]
@@ -4452,6 +4454,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
   function switchToDoc(docId) {
     if (!docs.has(docId)) return;
     _hideLoadingOverlay();
+    _stopNextcloudLivePoll();
     if (_diffModeActive) exitDiffMode(true);
 
     // Save current doc state before switching
@@ -4483,6 +4486,19 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
     if (textarea && doc.language !== 'email') textarea.value = doc.content || '';
     if (langSelect) langSelect.value = doc.language || 'markdown';
     if (badge) { const _v = doc.version || 1; badge.textContent = `v${_v}`; badge.style.display = _v > 1 ? '' : 'none'; }
+
+    // Nextcloud provenance badge
+    const ncBadge = document.getElementById('doc-nextcloud-badge');
+    if (ncBadge) {
+      if (doc.source_nextcloud_account && doc.source_nextcloud_path) {
+        const fname = doc.source_nextcloud_path.split('/').pop() || doc.source_nextcloud_path;
+        ncBadge.title = `Nextcloud: ${doc.source_nextcloud_path}`;
+        ncBadge.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px;"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg> ' + fname;
+        ncBadge.style.display = '';
+      } else {
+        ncBadge.style.display = 'none';
+      }
+    }
     { const _v = doc.version || 1; const _dbtn = document.getElementById('doc-diff-toggle-btn'); if (_dbtn) _dbtn.style.display = _v > 1 ? '' : 'none'; }
     syncHighlighting();
     // Deferred re-sync: ensure minHeight is correct after browser layout
@@ -4527,6 +4543,11 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
               const cached = docs.get(docId);
               if (cached && full && full.current_content) {
                 cached.content = full.current_content;
+                // Sync the textarea too — otherwise the auto-save timer
+                // (which still holds the pre-OCR content) would push stale
+                // content back to the server, creating a spurious version.
+                const ta = document.getElementById('doc-editor-textarea');
+                if (ta && docId === activeDocId) ta.value = full.current_content;
               }
             }
           }
@@ -4587,6 +4608,217 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
       _restoreSuggestionsFromStorage(docId);
     }
 
+    _startNextcloudLivePoll(doc);
+  }
+
+  // ---- Nextcloud live poll ----
+
+  function _stopNextcloudLivePoll() {
+    if (_ncLivePollTimer) {
+      clearInterval(_ncLivePollTimer);
+      _ncLivePollTimer = null;
+    }
+  }
+
+  function _startNextcloudLivePoll(doc) {
+    _stopNextcloudLivePoll();
+    if (!doc.source_nextcloud_account || !doc.source_nextcloud_path) return;
+
+    // Poll sync-docs every 2 minutes while this Nextcloud doc is visible.
+    // Using sync-docs is more reliable than stat (which can fail on auth)
+    // and actually pulls the new content when a remote change is found.
+    _ncLivePollTimer = setInterval(async () => {
+      // Only poll when the tab is visible and this doc is active
+      if (document.visibilityState === 'hidden') return;
+      if (activeDocId !== doc.id) return;
+
+      // Check if we already have a banner (don't sync again if already shown)
+      if (document.getElementById('nc-update-banner')) return;
+
+      try {
+        const r = await fetch(`${API_BASE}/api/nextcloud/sync-docs`, {
+          method: 'POST',
+          credentials: 'same-origin',
+        });
+        if (!r.ok) {
+          // Auth issue or server error — poll already won't help, stop trying
+          _stopNextcloudLivePoll();
+          return;
+        }
+        const result = await r.json();
+        if (result.updated > 0) {
+          // Sync found updates — reload the doc content into the editor
+          const dr = await fetch(`${API_BASE}/api/document/${doc.id}`, { credentials: 'same-origin' });
+          if (dr.ok) {
+            const full = await dr.json();
+            // Check for conflict: was this doc modified locally since last sync?
+            if (full.updated_at && full.nextcloud_synced_at &&
+                new Date(full.updated_at).getTime() > new Date(full.nextcloud_synced_at).getTime()) {
+              // CONFLICT: both local and remote changed — show conflict banner
+              _showNextcloudConflictBanner(doc, full.current_content);
+            } else {
+              // Only remote changed — safe to auto-refresh
+              const cached = docs.get(doc.id);
+              if (cached) {
+                cached.content = full.current_content;
+                cached.version = full.version_count;
+                cached.nextcloud_synced_at = full.nextcloud_synced_at;
+                cached.updated_at = full.updated_at;
+              }
+              const ta = document.getElementById('doc-editor-textarea');
+              if (ta && doc.id === activeDocId) ta.value = full.current_content;
+              syncHighlighting();
+              // Show a brief indicator that content was refreshed
+              _showNextcloudUpdateBanner(doc, { autoUpdated: true });
+            }
+          }
+        } else if (result.errors > 0 && !result.updated) {
+          // If sync had errors but no updates, don't stop polling — it might
+          // just be transient. Log to console for debugging.
+          console.warn('Nextcloud sync-docs had errors:', result);
+        }
+      } catch (_) {}
+    }, 120000); // 2 minutes
+  }
+
+  function _showNextcloudUpdateBanner(doc, opts) {
+    opts = opts || {};
+    // Don't show multiple banners
+    if (document.getElementById('nc-update-banner')) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'nc-update-banner';
+    banner.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 12px;background:color-mix(in srgb, var(--accent,var(--red)) 15%, transparent);border-bottom:1px solid color-mix(in srgb, var(--accent,var(--red)) 30%, transparent);color:var(--fg);font-size:12px;';
+
+    // Inline SVG cloud-download icon (no emoji)
+    const icon = document.createElement('span');
+    icon.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:0.8;"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>';
+    icon.style.cssText = 'display:inline-flex;';
+    banner.appendChild(icon);
+
+    const text = document.createElement('span');
+    if (opts.autoUpdated) {
+      text.textContent = 'Content refreshed from Nextcloud (remote change detected).';
+    } else {
+      text.textContent = 'Newer version available on Nextcloud.';
+    }
+    banner.appendChild(text);
+
+    if (opts.autoUpdated) {
+      // Auto-updated — just show a dismissible info banner, no extra actions
+      const dismissBtn = document.createElement('button');
+      dismissBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      dismissBtn.style.cssText = 'background:none;border:none;color:var(--fg);cursor:pointer;padding:2px;display:inline-flex;opacity:0.6;margin-left:auto;';
+      dismissBtn.onclick = () => banner.remove();
+      banner.appendChild(dismissBtn);
+    } else {
+      const refreshBtn = document.createElement('button');
+      refreshBtn.textContent = 'Refresh';
+      refreshBtn.style.cssText = 'background:var(--accent,var(--red));color:#fff;border:none;padding:2px 10px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px;';
+      refreshBtn.onclick = async () => {
+        banner.remove();
+        try {
+          await fetch(`${API_BASE}/api/nextcloud/sync-docs`, { method: 'POST', credentials: 'same-origin' });
+          const res = await fetch(`${API_BASE}/api/document/${doc.id}`, { credentials: 'same-origin' });
+          if (res.ok) {
+            const full = await res.json();
+            const cached = docs.get(doc.id);
+            if (cached) {
+              cached.content = full.current_content;
+              cached.version = full.version_count;
+              cached.nextcloud_synced_at = full.nextcloud_synced_at;
+            }
+            const ta = document.getElementById('doc-editor-textarea');
+            if (ta && doc.id === activeDocId) ta.value = full.current_content;
+            syncHighlighting();
+          }
+        } catch (_) {}
+      };
+      banner.appendChild(refreshBtn);
+
+      const dismissBtn = document.createElement('button');
+      dismissBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      dismissBtn.style.cssText = 'background:none;border:none;color:var(--fg);cursor:pointer;padding:2px;display:inline-flex;opacity:0.6;margin-left:auto;';
+      dismissBtn.onclick = () => { banner.remove(); _stopNextcloudLivePoll(); };
+      banner.appendChild(dismissBtn);
+    }
+
+    // Insert at the top of the editor pane, above the editor content
+    const wrap = document.getElementById('doc-editor-wrap');
+    if (wrap) wrap.insertBefore(banner, wrap.firstChild);
+  }
+
+  function _showNextcloudConflictBanner(doc, remoteContent) {
+    // Don't show multiple banners
+    if (document.getElementById('nc-update-banner')) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'nc-update-banner';
+    banner.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 12px;background:color-mix(in srgb, var(--yellow,#d4a000) 15%, transparent);border-bottom:1px solid color-mix(in srgb, var(--yellow,#d4a000) 30%, transparent);color:var(--fg);font-size:12px;flex-wrap:wrap;';
+
+    // Inline SVG warning triangle with exclamation icon (no emoji)
+    const icon = document.createElement('span');
+    icon.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;color:var(--yellow,#d4a000);"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+    icon.style.cssText = 'display:inline-flex;';
+    banner.appendChild(icon);
+
+    const text = document.createElement('span');
+    text.textContent = 'File changed both locally and on Nextcloud — review before syncing.';
+    text.style.cssText = 'flex:1;min-width:200px;';
+    banner.appendChild(text);
+
+    // "Keep local" button
+    const keepBtn = document.createElement('button');
+    keepBtn.textContent = 'Keep local';
+    keepBtn.style.cssText = 'background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px;';
+    keepBtn.onclick = () => {
+      banner.remove();
+      _stopNextcloudLivePoll();
+    };
+    banner.appendChild(keepBtn);
+
+    // "Pull remote" button
+    const pullBtn = document.createElement('button');
+    pullBtn.textContent = 'Pull remote';
+    pullBtn.style.cssText = 'background:var(--accent,var(--red));color:#fff;border:none;padding:2px 10px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px;';
+    pullBtn.onclick = async () => {
+      banner.remove();
+      // Fetch the latest content and update the editor
+      try {
+        const res = await fetch(`${API_BASE}/api/document/${doc.id}`, { credentials: 'same-origin' });
+        if (res.ok) {
+          const full = await res.json();
+          const cached = docs.get(doc.id);
+          if (cached) {
+            cached.content = full.current_content;
+            cached.version = full.version_count;
+            cached.nextcloud_synced_at = full.nextcloud_synced_at;
+            cached.updated_at = full.updated_at;
+          }
+          const ta = document.getElementById('doc-editor-textarea');
+          if (ta && doc.id === activeDocId) ta.value = full.current_content;
+          syncHighlighting();
+        }
+      } catch (_) {}
+    };
+    banner.appendChild(pullBtn);
+
+    // "Review changes" button
+    const reviewBtn = document.createElement('button');
+    reviewBtn.textContent = 'Review changes';
+    reviewBtn.style.cssText = 'background:var(--bg);color:var(--fg);border:1px solid var(--accent,var(--red));padding:2px 10px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px;';
+    reviewBtn.onclick = () => {
+      banner.remove();
+      _stopNextcloudLivePoll();
+      const ta = document.getElementById('doc-editor-textarea');
+      const localContent = ta ? ta.value : '';
+      enterDiffMode(localContent, remoteContent);
+    };
+    banner.appendChild(reviewBtn);
+
+    // Insert at the top of the editor pane, above the editor content
+    const wrap = document.getElementById('doc-editor-wrap');
+    if (wrap) wrap.insertBefore(banner, wrap.firstChild);
   }
 
   // Close a doc tab without breaking its chat association. The chat transcript
@@ -4834,6 +5066,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
         <button id="doc-header-preview-btn" class="doc-action-icon-btn" title="Run / Preview" style="display:none;opacity:0.85;gap:4px;"></button>
         <span id="doc-stream-indicator" class="doc-stream-indicator" style="display:none"><span class="doc-stream-dot"></span> editing</span>
         <span id="doc-version-badge" class="doc-version-badge" title="Version history" style="display:none">v1</span>
+        <span id="doc-nextcloud-badge" class="doc-nextcloud-badge" style="display:none"></span>
         <span style="flex:1"></span>
         <button id="doc-export-pdf-btn" class="doc-action-icon-btn" title="Export PDF" style="display:none;opacity:0.7;gap:4px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 18 15 15"/></svg> <span style="font-size:11px;">Export PDF</span></button>
         <button id="doc-pdf-view-btn" class="doc-action-icon-btn" title="Toggle PDF view" style="display:none;opacity:0.7;gap:4px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> <span style="font-size:11px;">PDF</span></button>
@@ -6817,6 +7050,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
   }
 
   export function closePanel(direction) {
+    _stopNextcloudLivePoll();
     if (!isOpen) {
       if (direction !== 'down' && Modals.isRegistered('doc-panel')) {
         _minimizedDocId = null;
@@ -7236,11 +7470,19 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
       sessionId: sessionId || doc.session_id,
       userSetLanguage: !!doc.language,
       _composeAtts: existing?._composeAtts,
+      // Preserve OCR-suppression flag: prevents redundant extract-pdf-text on
+      // re-open when the document was already imported with text extracted.
+      _ocrTriggered: !!(existing && existing._ocrTriggered) || !!doc._ocrTriggered,
       // Provenance for the "Send signed reply" flow
       sourceEmailUid:       doc.source_email_uid || null,
       sourceEmailFolder:    doc.source_email_folder || null,
       sourceEmailAccountId: doc.source_email_account_id || null,
       sourceEmailMessageId: doc.source_email_message_id || null,
+      // Nextcloud provenance (drives live poll + sync badge)
+      source_nextcloud_account: doc.source_nextcloud_account || null,
+      source_nextcloud_path:    doc.source_nextcloud_path || null,
+      nextcloud_synced_at:      doc.nextcloud_synced_at || null,
+      updated_at:               doc.updated_at || null,
     });
   }
 
@@ -7429,7 +7671,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
     // 'svg' so the preview/run routing still treats it as renderable markup).
     const _hlLang = lang === 'svg' ? 'xml' : lang;
     codeEl.className = _hlLang ? `language-${_hlLang}` : '';
-    if (window.hljs && _hlLang) {
+    if (window.hljs && _hlLang && window.hljs.getLanguage(_hlLang)) {
       codeEl.removeAttribute('data-highlighted');
       window.hljs.highlightElement(codeEl);
     }
@@ -9283,6 +9525,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
       if (docs.has(savingDocId)) {
         docs.get(savingDocId).version = doc.version_count || 1;
         docs.get(savingDocId).content = contentToSave;
+        docs.get(savingDocId).updated_at = doc.updated_at;
       }
       _syncDocIndicator();
       if (!silent && uiModule) uiModule.showToast(forceVersion ? 'New version saved' : 'Document saved');

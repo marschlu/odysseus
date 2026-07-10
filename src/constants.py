@@ -85,6 +85,7 @@ WEB_FETCH_HARD_MAX_BYTES = 20_000_000   # absolute ceiling, even with override (
 # non-positive value degrades to MAX_READ_CHARS rather than crashing startup.
 NEXTCLOUD_DAV_PATH = "/remote.php/dav/files"  # appended with /<username>/<path>
 NEXTCLOUD_REQUEST_TIMEOUT = 20                # seconds for WebDAV PROPFIND/GET
+NEXTCLOUD_PUT_TIMEOUT = 60                   # seconds for WebDAV PUT (uploads may be slower)
 try:
     NEXTCLOUD_MAX_READ_CHARS = int(os.getenv("ODYSSEUS_NEXTCLOUD_MAX_READ_CHARS") or MAX_READ_CHARS)
 except (TypeError, ValueError):
@@ -97,6 +98,8 @@ except (TypeError, ValueError):
     NEXTCLOUD_MAX_DOWNLOAD_BYTES = 50_000_000
 if NEXTCLOUD_MAX_DOWNLOAD_BYTES <= 0:
     NEXTCLOUD_MAX_DOWNLOAD_BYTES = 50_000_000
+
+NEXTCLOUD_SYNC_INTERVAL_SECONDS = int(os.getenv("ODYSSEUS_NEXTCLOUD_SYNC_INTERVAL", "300"))
 
 # API Configuration
 MAX_CONTEXT_MESSAGES = 90
